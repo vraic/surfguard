@@ -56,9 +56,29 @@ Rehearse before every first-of-its-kind release.
 2. **First release only:** verify/create the RubyGems pending trusted
    publisher **immediately before tagging** (pending publishers expire after
    ~12 hours) — see one-time setup below.
-3. On an up-to-date `main` checkout: `rake tag`. Guards: clean tree, on
-   `main`, HEAD == the fetched canonical push URL, and the remote tag absent.
-   Retry is allowed only for an exact annotated local tag that peels to HEAD.
+3. **Tag the commit you rehearsed — not "latest `main`".** Immediately before
+   `rake tag`, assert that the checkout is still exactly the rehearsed commit
+   and that remote `main` has not moved past it:
+
+   ```sh
+   REHEARSED=<head_sha of the successful workflow_dispatch run>
+   test "$(git rev-parse HEAD)" = "$REHEARSED" || { echo "checkout is not the rehearsed commit"; exit 1; }
+   test "$(gh api repos/basecamp/surfguard/commits/main --jq .sha)" = "$REHEARSED" \
+     || { echo "remote main advanced; re-rehearse on the new head"; exit 1; }
+   ```
+
+   Do **not** `git pull` at this point. A fast-forward here silently moves the
+   checkout off the rehearsed commit onto one whose bytes nobody has built, and
+   `rake tag` would accept it — its guard is HEAD == fetched `main`, which a
+   pull satisfies by construction. If `main` has advanced, the answer is to
+   re-rehearse on the new head, not to tag past the rehearsal.
+
+   Then `rake tag`. Guards: clean tree, on `main`, HEAD == the fetched
+   canonical push URL, and the remote tag absent. Retry is allowed only for an
+   exact annotated local tag that peels to HEAD. The residual race is safe in
+   one direction only: if `main` advances between the assertion and the push,
+   `rake tag` re-fetches and aborts — it cannot tag the wrong commit, it can
+   only refuse.
 4. Approve the `release-rubygems` environment when the run pauses.
 5. Watch the run to completion. Verify afterwards:
    - digest equality across the RubyGems download, the GitHub Release asset,
@@ -200,15 +220,58 @@ release ships as a new patch version, exactly as it does for the gem.
 
 The registry reconciliation makes re-running a tag's workflow **idempotent**:
 it never re-pushes bytes that are already published, and it fails closed on
-any conflict. Recovery rules, by failure state:
+any conflict.
+
+The discriminator is the **remote** tag — not whether anything was published —
+and then whether a corrective commit is needed. `rake tag` creates the local tag
+before it pushes, and pushes `main` and the tag as two separate operations, so a
+failed `rake tag` can leave a local tag with no remote counterpart. Establish
+which state you are in before acting:
+
+**Do not use `git ls-remote` to establish this.** A URL spelled out in full on
+the command line is still rewritten by `url.<base>.insteadOf`, so the query can
+silently inspect a different repository and report the canonical tag absent —
+and a rewriting `insteadOf` rule has already been configured on this maintainer's
+machine once. Ask GitHub directly, over a path that touches no Git
+configuration:
+
+```sh
+gh api repos/basecamp/surfguard/git/matching-refs/tags/vX.Y.Z \
+  --jq '[.[]|select(.ref=="refs/tags/vX.Y.Z")]|length'
+```
+
+**The exact-ref filter is required, not tidiness.** `matching-refs` matches by
+**prefix**: querying `tags/v0.1` returns `v0.1.0`, `v0.1.1`, `v0.1.2` and
+`v0.1.3`. So if `vX.Y.Z` is absent while some `vX.Y.Z…` tag exists — a
+`-rc1`, or `v1.2.30` against a query for `v1.2.3` — the raw array is populated
+even though your tag is not there, and an unfiltered length test misroutes an
+absent tag into the present-tag rows. Filter to the exact ref, then test.
+
+Read the filtered result as: `0` means the tag is **definitively absent**; `1`
+means present. Any non-200 — auth failure, a secondary rate limit, a network
+error — means **unknown, not absent**. Never route on a failed query.
+
+When it is present, it is not automatically *your* tag; a concurrent attempt
+could have won the name. Compare it against the tag you still hold:
+
+```sh
+gh api repos/basecamp/surfguard/git/matching-refs/tags/vX.Y.Z \
+  --jq '.[]|select(.ref=="refs/tags/vX.Y.Z")|.object.sha'   # remote tag object
+git rev-parse vX.Y.Z                                        # local tag object
+git rev-parse 'vX.Y.Z^{commit}'                             # local peeled commit
+```
 
 | State | Recovery |
 |---|---|
-| Failure before `gem push` ran (test/source/build/package/rebuild/reconciliation) | Fix on `main`; delete the unpublished tag; re-tag. Allowed **only** because nothing was published. Tag deletion has **no standing bypass** — an admin must temporarily lift the `release-tags-immutable` ruleset, delete, and re-enable it. That friction is deliberate. |
-| Push succeeded; confirm/attest/release failed | Re-run the same run/tag. Reconciliation sees same-SHA → skips the push; downstream completes idempotently. |
-| **Ambiguous push result** (push errored/timed out; registry state unknown) | Never use a later 404 to justify deleting or moving the tag. Poll, then **download the canonical RubyGems bytes and compare digests**. Match → re-run the same tag to finish. Absent after bounded polling → re-run the same tag (reconciliation decides). Indeterminate/conflicting → **stop; contact RubyGems support**. |
+| Remote tag **absent**, remote `main` still equals your tagged `HEAD`, no corrective commit needed (transient push failure) | Re-run `rake tag`. The local tag still peels to `HEAD` and `HEAD` still equals fetched `main`, so `rake tag` accepts it as the exact retryable annotated tag and re-pushes. No deletion, no ruleset change. |
+| Remote tag **absent**, but remote `main` has **advanced** (an unrelated PR landed) | Re-running `rake tag` will *not* work: it fetches `main` and aborts because your tagged `HEAD` no longer equals it, and you cannot fast-forward while keeping the tag because the peel check then rejects the pair. Prove the remote tag absent (the filtered query above returns `0`), delete the **local** ref only (`git tag -d vX.Y.Z`), fast-forward, **re-rehearse on the new head**, and tag that. The rehearsed commit must be the commit you tag. |
+| Remote tag **absent**, a corrective commit **is** needed | Same shape: the fix moves `HEAD`, so the stale local tag no longer peels to it and `rake tag` aborts by design. Prove the remote tag absent, then delete the **local** ref only: `git tag -d vX.Y.Z`. This touches no remote ref and no ruleset — it is **not** the immutability case. Commit the fix, **re-rehearse**, and re-run `rake tag`. |
+| Remote tag **present and identical** to your local tag object, run failed at any stage | `gh run rerun <RUN_ID>`. Reconciliation is idempotent: same-SHA skips the push, downstream completes. **Never re-push, move, or delete the tag.** A defect that survives the re-run ships as the next patch version. |
+| Remote tag **present but different** from your local tag object (or you no longer hold one) | **Stop.** Another attempt won this tag name. Mere presence is not proof the remote tag is the one whose bytes you rehearsed, and the workflow only checks that its tag is well formed and points into `main` — not that it matches your checkout. Do not approve that run's environments; reconcile who tagged what first. |
+| **Ambiguous** (push errored or timed out) | Resolve the state before acting: run the `matching-refs` query above and the object comparison, then route to a row above. Never treat a 404 or a failed query as licence to delete. If registry state is also unknown, **download the canonical RubyGems bytes and compare digests**; indeterminate or conflicting → **stop; contact RubyGems support**. |
 | Workflow defect embedded in a published tag | Re-runs use the tagged workflow; fixing `main` doesn't fix the tag. Never move/delete the tag. Run `release-recovery.yml` (dispatch with the version) to finish attestation + the GitHub Release from verified canonical registry bytes; ship the workflow fix in the next version. |
 | Bad published release | Never re-point or delete the tag. Ship a new patch version (per SECURITY.md, fixes ship as new releases). Yank only for security-critical cases. |
+| Anything that appears to require lifting `release-tags-immutable` | **Stop.** Obtain a separately reviewed break-glass runbook. Do not improvise a ruleset change on a public security gem under pressure. No row above needs one: the only deletion any of them permits is of a **local** ref. |
 
 `release-recovery.yml` never publishes and never mints RubyGems credentials.
 It mirrors the release pipeline's privilege separation: an **unprivileged
@@ -391,6 +454,39 @@ back with sole reviewer `jeremy` (numeric id 199), self-review allowed,
 (branch). The unused `copilot` environment was verified to have no protection
 rules and deleted; readback lists only `github-release`, `release-recovery`,
 and `release-rubygems`.
+
+> **Correction (2026-08-22).** The `copilot` environment is **not deletable in
+> any lasting sense**, so the sentence above records an end state that does not
+> hold. It was present again on 2026-08-22 at `created_at`
+> `2026-08-17T21:56:44Z` — one second after pull request #11 was opened
+> (`21:56:43Z`), in the burst that opened #9–#13. Deleting it on 2026-08-22
+> reproduced the mechanism exactly: it reappeared with a **new** id and a new
+> `created_at` ten seconds after the next pull request was opened. The cause is
+> the active `Copilot Reviews` ruleset (`copilot_code_review`, scoped `~ALL`),
+> which makes GitHub create the environment on demand for each pull request.
+>
+> So the readback was almost certainly accurate the moment it was taken, and an
+> unrelated pull request recreated the environment seconds later. The defect is
+> not a false record — it is that a **transient** deletion was written down as a
+> settled control, and that "the readback lists only three environments" is an
+> assertion which cannot stay true in a repository that receives pull requests.
+>
+> This costs nothing in release authority. Across both incarnations the
+> environment had no protection rules, no deployment branch policy, no secrets,
+> no variables, no deployments, and no reference from any workflow; `release.yml`
+> and `release-recovery.yml` name only `release-rubygems`, `github-release` and
+> `release-recovery`. It can neither gate nor bypass any release job.
+>
+> The pre-tag gate therefore asserts **protection values, not an environment
+> count**: the three release environments must each carry the required-reviewer
+> and `can_admins_bypass` settings recorded above, and any environment outside
+> that set must be inert — no protection rules, no branch policy, no secrets, no
+> variables, no deployments. That assertion survives Copilot recreating
+> `copilot`; an equality check on the environment list would fail the release
+> spuriously after any pull request.
+>
+> Recorded as a correction rather than by amending the original paragraph, so
+> that the reason this readback could not be reproduced stays visible.
 
 Repository Actions were changed from unrestricted to selected repositories
 and read back with full-SHA pinning required, GitHub-owned/verified blanket
